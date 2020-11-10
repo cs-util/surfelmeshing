@@ -35,8 +35,9 @@
 
 #include <boost/filesystem.hpp>
 #include <cuda_runtime.h>
-#include <glog/logging.h>
+#include <libvis/logging.h>
 #include <libvis/command_line_parser.h>
+#include <libvis/cuda/cuda_buffer.h>
 #include <libvis/image_display.h>
 #include <libvis/libvis.h>
 #include <libvis/mesh_opengl.h>
@@ -50,17 +51,21 @@
 #include <libvis/shader_program_opengl.h>
 #include <libvis/sophus.h>
 #include <libvis/timing.h>
-#include <pcl/io/ply_io.h>
+#include <libvis/image.h>
 #include <signal.h>
 #include <spline_library/splines/uniform_cr_spline.h>
+#include <chrono> 
+#include <thread>
+
+#ifndef WIN32
 #include <termios.h>
 #include <unistd.h>
-#include <QApplication>
+#else
+#include <conio.h> // _getch()
+#endif
 
 #include "surfel_meshing/asynchronous_meshing.h"
-#include <libvis/cuda/cuda_buffer.h>
 #include "surfel_meshing/cuda_depth_processing.cuh"
-#include "surfel_meshing/cuda_surfel_reconstruction.cuh"
 #include "surfel_meshing/cuda_surfel_reconstruction.h"
 #include "surfel_meshing/surfel_meshing_render_window.h"
 #include "surfel_meshing/surfel.h"
@@ -71,7 +76,12 @@ using namespace vis;
 
 // Get a key press from the terminal without requiring the Return key to confirm.
 // From https://stackoverflow.com/questions/421860
-char getch() {
+#ifdef WIN32
+char portable_getch() {
+    return _getch();
+}
+#else
+char portable_getch() {
   char buf = 0;
   struct termios old = {0};
   if (tcgetattr(0, &old) < 0) {
@@ -94,6 +104,7 @@ char getch() {
   }
   return (buf);
 }
+#endif
 
 
 // Helper to use splines from the used spline library with single-dimension values.
@@ -172,25 +183,21 @@ bool SavePointCloudAsPLY(
     const std::string& export_point_cloud_path) {
   CHECK_EQ(surfel_meshing.surfels().size(), reconstruction.surfels_size());
   
-  Point3fC3u8Cloud cloud;
-  surfel_meshing.ConvertToPoint3fC3u8Cloud(&cloud);
+  Point3fCloud cloud;
+  surfel_meshing.ConvertToPoint3fCloud(&cloud);
   
-  pcl::PointCloud<pcl::PointNormal>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointNormal>());
-  pcl_cloud->resize(cloud.size());
+  Point3fC3u8NfCloud final_cloud(cloud.size());
   usize index = 0;
   for (usize i = 0; i < cloud.size(); ++ i) {
-    pcl_cloud->at(i).x = cloud[i].position().x();
-    pcl_cloud->at(i).y = cloud[i].position().y();
-    pcl_cloud->at(i).z = cloud[i].position().z();
+    final_cloud[i].position() = cloud[i].position();
+    final_cloud[i].color() = Vec3u8(255, 255, 255);  // TODO: Export colors as well.
     while (surfel_meshing.surfels()[index].node() == nullptr) {
       ++ index;
     }
-    pcl_cloud->at(i).normal_x = surfel_meshing.surfels()[index].normal().x();
-    pcl_cloud->at(i).normal_y = surfel_meshing.surfels()[index].normal().y();
-    pcl_cloud->at(i).normal_z = surfel_meshing.surfels()[index].normal().z();
+    final_cloud[i].normal() = surfel_meshing.surfels()[index].normal();
     ++ index;
   }
-  pcl::io::savePLYFileBinary(export_point_cloud_path, *pcl_cloud);
+  final_cloud.WriteAsPLY(export_point_cloud_path);
   LOG(INFO) << "Wrote " << export_point_cloud_path << ".";
   return true;
 }
@@ -245,20 +252,24 @@ void MedianFilterAndDensifyDepthMap(const Image<u16>& input, Image<u16>* output)
 }
 
 
-int main(int argc, char** argv) {
-  LIBVIS_APPLICATION();
-  
-  FLAGS_logtostderr = 1;
-  google::InitGoogleLogging(argv[0]);
-  
+int LIBVIS_MAIN(int argc, char** argv) {
+#ifdef WIN32
+    ImageIOLibPngRegistrator image_io_libpng_registrator_;
+    ImageIONetPBMRegistrator image_io_netpbm_registrator_;
+#ifdef LIBVIS_HAVE_QT
+    ImageIOQtRegistrator image_io_qt_registrator_;
+#endif
+#endif
   // Ignore SIGTTIN and SIGTTOU. I am not sure why they occurred: it seems that
   // they should only occur for background processes trying to interact with the
   // terminal, but they seemingly happened to me while there was no background
   // process and they interfered with using gdb.
   // TODO: Find out the reason for those signals
+#ifndef WIN32
   signal(SIGTTIN, SIG_IGN);
   signal(SIGTTOU, SIG_IGN);
-  
+#endif
+
   
   // ### Parse parameters ###
   
@@ -269,6 +280,11 @@ int main(int argc, char** argv) {
   cmd_parser.NamedParameter(
       "--depth_scaling", &depth_scaling, /*required*/ false,
       "Input depth scaling: input_depth = depth_scaling * depth_in_meters. The default is for TUM RGB-D benchmark datasets.");
+  
+  float max_pose_interpolation_time_extent = 0.05f;
+  cmd_parser.NamedParameter(
+      "--max_pose_interpolation_time_extent", &max_pose_interpolation_time_extent, /*required*/ false,
+      "The maximum time (in seconds) between the timestamp of a frame, and the preceding respectively succeeding trajectory pose timestamp, to interpolate the frame's pose. If this threshold is exceeded, the frame will be dropped since no close-enough pose information is available.");
   
   int start_frame = 0;
   cmd_parser.NamedParameter(
@@ -595,19 +611,18 @@ int main(int argc, char** argv) {
   // ### Initialization ###
   
   // Create render window.
-  shared_ptr<SurfelMeshingRenderWindow> render_window =
-      shared_ptr<SurfelMeshingRenderWindow>(
-          new SurfelMeshingRenderWindow(render_new_surfels_as_splats,
-                                        splat_half_extent_in_pixels,
-                                        triangle_normal_shading,
-                                        render_camera_frustum));
+  shared_ptr<SurfelMeshingRenderWindow> render_window(
+      new SurfelMeshingRenderWindow(render_new_surfels_as_splats,
+                                    splat_half_extent_in_pixels,
+                                    triangle_normal_shading,
+                                    render_camera_frustum));
   shared_ptr<RenderWindow> generic_render_window =
       RenderWindow::CreateWindow("SurfelMeshing", render_window_default_width, render_window_default_height, RenderWindow::API::kOpenGL, render_window);
   
   // Load dataset.
   RGBDVideo<Vec3u8, u16> rgbd_video;
   
-  if (!ReadTUMRGBDDatasetAssociatedAndCalibrated(dataset_folder_path.c_str(), trajectory_filename.c_str(), &rgbd_video)) {
+  if (!ReadTUMRGBDDatasetAssociatedAndCalibrated(dataset_folder_path.c_str(), trajectory_filename.c_str(), &rgbd_video, max_pose_interpolation_time_extent)) {
     LOG(FATAL) << "Could not read dataset.";
   } else {
     CHECK_EQ(rgbd_video.depth_frames_mutable()->size(), rgbd_video.color_frames_mutable()->size());
@@ -813,7 +828,8 @@ int main(int argc, char** argv) {
       debug_normal_rendering,
       &neighbor_index_buffer_resource,
       &normal_vertex_buffer_resource);
-  OpenGLContext no_opengl_context = SwitchOpenGLContext(opengl_context);
+  OpenGLContext no_opengl_context;
+  SwitchOpenGLContext(opengl_context, &no_opengl_context);
   
   // Allocate reconstruction objects.
   CUDASurfelReconstruction reconstruction(
@@ -1004,8 +1020,8 @@ int main(int argc, char** argv) {
         bilateral_filter_radius_factor,
         depth_scaling * max_depth,
         depth_valid_region_radius,
-        *depth_buffer,
-        &filtered_depth_buffer_A);
+        depth_buffer->ToCUDA(),
+        &filtered_depth_buffer_A.ToCUDA());
     cudaEventRecord(bilateral_filtering_post_event, stream);
     
     // DEBUG: Show bilateral filtering result.
@@ -1023,19 +1039,20 @@ int main(int argc, char** argv) {
     SE3f input_depth_frame_scaled_frame_T_global = input_depth_frame->frame_T_global();
     input_depth_frame_scaled_frame_T_global.translation() = depth_scaling * input_depth_frame_scaled_frame_T_global.translation();
     
-    const CUDABuffer<u16>* other_depths[outlier_filtering_frame_count];
-    SE3f global_TR_others[outlier_filtering_frame_count];
-    CUDAMatrix3x4 others_TR_reference[outlier_filtering_frame_count];
+    std::vector< const CUDABuffer_<u16>* > other_depths(outlier_filtering_frame_count);
+    std::vector<SE3f> global_TR_others(outlier_filtering_frame_count);
+    std::vector<CUDAMatrix3x4> others_TR_reference(outlier_filtering_frame_count);
+    
     for (int i = 0; i < outlier_filtering_frame_count / 2; ++ i) {
       int offset = i + 1;
       
-      other_depths[i] = frame_index_to_depth_buffer.at(frame_index - offset).get();
+      other_depths[i] = &frame_index_to_depth_buffer.at(frame_index - offset)->ToCUDA();
       global_TR_others[i] = rgbd_video.depth_frame_mutable(frame_index - offset)->global_T_frame();
       global_TR_others[i].translation() = depth_scaling * global_TR_others[i].translation();
       others_TR_reference[i] = CUDAMatrix3x4((input_depth_frame_scaled_frame_T_global * global_TR_others[i]).inverse().matrix3x4());
       
       int k = outlier_filtering_frame_count / 2 + i;
-      other_depths[k] = frame_index_to_depth_buffer.at(frame_index + offset).get();
+      other_depths[k] = &frame_index_to_depth_buffer.at(frame_index + offset)->ToCUDA();
       global_TR_others[k] = rgbd_video.depth_frame_mutable(frame_index + offset)->global_T_frame();
       global_TR_others[k].translation() = depth_scaling * global_TR_others[k].translation();
       others_TR_reference[k] = CUDAMatrix3x4((input_depth_frame_scaled_frame_T_global * global_TR_others[k]).inverse().matrix3x4());
@@ -1048,11 +1065,14 @@ int main(int argc, char** argv) {
           OutlierDepthMapFusionCUDA<other_frame_count + 1, u16>( \
               stream, \
               outlier_filtering_depth_tolerance_factor, \
-              filtered_depth_buffer_A, \
-              depth_camera, \
-              other_depths, \
-              others_TR_reference, \
-              &filtered_depth_buffer_B)
+              filtered_depth_buffer_A.ToCUDA(), \
+              depth_camera.parameters()[0], \
+              depth_camera.parameters()[1], \
+              depth_camera.parameters()[2], \
+              depth_camera.parameters()[3], \
+              other_depths.data(), \
+              others_TR_reference.data(), \
+              &filtered_depth_buffer_B.ToCUDA())
       if (outlier_filtering_frame_count == 2) {
         CALL_OUTLIER_FUSION(2);
       } else if (outlier_filtering_frame_count == 4) {
@@ -1072,11 +1092,14 @@ int main(int argc, char** argv) {
               stream, \
               outlier_filtering_required_inliers, \
               outlier_filtering_depth_tolerance_factor, \
-              filtered_depth_buffer_A, \
-              depth_camera, \
-              other_depths, \
-              others_TR_reference, \
-              &filtered_depth_buffer_B)
+              filtered_depth_buffer_A.ToCUDA(), \
+              depth_camera.parameters()[0], \
+              depth_camera.parameters()[1], \
+              depth_camera.parameters()[2], \
+              depth_camera.parameters()[3], \
+              other_depths.data(), \
+              others_TR_reference.data(), \
+              &filtered_depth_buffer_B.ToCUDA())
       if (outlier_filtering_frame_count == 2) {
         CALL_OUTLIER_FUSION(2);
       } else if (outlier_filtering_frame_count == 4) {
@@ -1107,13 +1130,13 @@ int main(int argc, char** argv) {
       ErodeDepthMapCUDA(
           stream,
           depth_erosion_radius,
-          filtered_depth_buffer_B,
-          &filtered_depth_buffer_A);
+          filtered_depth_buffer_B.ToCUDA(),
+          &filtered_depth_buffer_A.ToCUDA());
     } else {
       CopyWithoutBorderCUDA(
           stream,
-          filtered_depth_buffer_B,
-          &filtered_depth_buffer_A);
+          filtered_depth_buffer_B.ToCUDA(),
+          &filtered_depth_buffer_A.ToCUDA());
     }
     
     cudaEventRecord(depth_erosion_post_event, stream);
@@ -1132,10 +1155,13 @@ int main(int argc, char** argv) {
         stream,
         observation_angle_threshold_deg,
         depth_scaling,
-        depth_camera,
-        filtered_depth_buffer_A,
-        &filtered_depth_buffer_B,
-        &normals_buffer);
+        depth_camera.parameters()[0],
+        depth_camera.parameters()[1],
+        depth_camera.parameters()[2],
+        depth_camera.parameters()[3],
+        filtered_depth_buffer_A.ToCUDA(),
+        &filtered_depth_buffer_B.ToCUDA(),
+        &normals_buffer.ToCUDA());
     
     cudaEventRecord(normal_computation_post_event, stream);
     
@@ -1156,10 +1182,13 @@ int main(int argc, char** argv) {
         point_radius_extension_factor,
         point_radius_clamp_factor,
         depth_scaling,
-        depth_camera,
-        filtered_depth_buffer_B,
-        &radius_buffer,
-        &filtered_depth_buffer_A);
+        depth_camera.parameters()[0],
+        depth_camera.parameters()[1],
+        depth_camera.parameters()[2],
+        depth_camera.parameters()[3],
+        filtered_depth_buffer_B.ToCUDA(),
+        &radius_buffer.ToCUDA(),
+        &filtered_depth_buffer_A.ToCUDA());
     
     
     // ### Loop closures ###
@@ -1267,7 +1296,11 @@ int main(int argc, char** argv) {
         // No need for efficiency here, use simple polling waiting
         LOG(INFO) << "Waiting for final mesh ...";
         while (!triangulation_thread->all_work_done()) {
+#ifdef WIN32 // XXX is this working as well as usleep 0?
+            Sleep(0);
+#else
           usleep(0);
+#endif
         }
         triangulation_thread->RequestExitAndWaitForIt();
         LOG(INFO) << "Got final mesh";
@@ -1516,7 +1549,7 @@ int main(int argc, char** argv) {
     
     if (step_by_step_playback || (show_result && is_last_frame)) {
       while (true) {
-        int key = getch();
+        int key = portable_getch();
         
         if (key == 10) {
           // Return key.
@@ -1651,7 +1684,11 @@ int main(int argc, char** argv) {
     if (actual_frame_time < min_frame_time) {
       constexpr float kSecondsToMicroSeconds = 1000 * 1000;
       usize microseconds = kSecondsToMicroSeconds * (min_frame_time - actual_frame_time);
-      usleep(microseconds);
+#ifdef WIN32 // XXX is this working?
+          std::this_thread::sleep_for(std::chrono::microseconds(microseconds));
+#else
+          usleep(microseconds);
+#endif
     }
   }  // End of main loop
   

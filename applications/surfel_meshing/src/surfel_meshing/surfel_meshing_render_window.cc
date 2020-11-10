@@ -34,10 +34,14 @@
 #include "surfel_meshing/surfel_meshing_render_window.h"
 
 #include <GL/glew.h>
-#include <GL/glx.h>
 
-#include "surfel_meshing/cuda_surfel_reconstruction.cuh"
+#ifndef WIN32
+#include <GL/glx.h>
+#endif
+
 #include <libvis/cuda/cuda_util.h>
+
+#include "surfel_meshing/cuda_surfel_reconstruction_kernels.cuh"
 
 namespace vis {
 

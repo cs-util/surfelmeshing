@@ -1,50 +1,90 @@
 cmake_minimum_required(VERSION 2.8.11)
+project(libvis LANGUAGES C CXX)
 
-project(libvis)
 
-# Make CMake find the Find<Package>.cmake files.
+# Enable C++11 globally
+set(CMAKE_CXX_STANDARD 11)
+
+# Support IDEs: https://cliutils.gitlab.io/modern-cmake/chapters/features/ides.html
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+set_property(GLOBAL PROPERTY PREDEFINED_TARGETS_FOLDER "cmake-default-targets")
+
+if(MSVC)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /MP")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
+  message ("Enabling parallel builds in visual studio")
+endif()
+
+# Make CMake find the Find<Package>.cmake files in the cmake subdirectory.
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake")
+
+include(CheckLanguage)
 
 
 ################################################################################
 # Dependencies and settings.
 
 # CUDA (external)
-find_package(CUDA REQUIRED)
-include(${CMAKE_SOURCE_DIR}/cmake/SelectCudaComputeArch.cmake)
-# if(CUDA_MULTI_ARCH)
-#     CUDA_SELECT_NVCC_ARCH_FLAGS(CUDA_ARCH_FLAGS All)
-# else()
-    CUDA_SELECT_NVCC_ARCH_FLAGS(CUDA_ARCH_FLAGS Auto)
-# endif()
-list(APPEND CUDA_NVCC_FLAGS ${CUDA_ARCH_FLAGS})
-list(APPEND CUDA_NVCC_FLAGS "-std=c++11")
-list(APPEND CUDA_NVCC_FLAGS "-Xcompiler -fPIC")
-list(APPEND CUDA_NVCC_FLAGS "-use_fast_math")
+# Enable C++11 globally
+# NOTE: The user of this CMake file should set the CUDA arch when invoking
+#       CMake, for example with: -DCMAKE_CUDA_FLAGS="-arch=sm_61"
+#       Common settings are either the 'native' arch for which the binary will
+#       be known to run on exclusively, or a broader set of PTX architectures
+#       in case the binary is intended for distribution.
+check_language(CUDA)
+if (CMAKE_CUDA_COMPILER)
+  enable_language(CUDA)
+  
+  # Enable C++11 globally for CUDA code
+  if(NOT DEFINED CMAKE_CUDA_STANDARD)
+    set(CMAKE_CUDA_STANDARD 11)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  endif()
+else()
+  message(FATAL_ERROR "CMake did not find CUDA, which is required to build this program.")
+endif()
+
+# Cross-platform threading. See:
+# https://cmake.org/cmake/help/latest/module/FindThreads.html
+find_package(Threads REQUIRED)
+find_package(OpenGL REQUIRED)
 
 # Eigen (external)
 find_package(Eigen3)
 include_directories(${EIGEN3_INCLUDE_DIR})
 
-# # OpenMP (external)
-# find_package(OpenMP)
-# if (OPENMP_FOUND)
-#   set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-#   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-# endif()
-
 # Boost (external)
+if (POLICY CMP0074) # get rid of annoying warning
+  cmake_policy(SET CMP0074 NEW)
+endif()
 find_package(Boost COMPONENTS serialization filesystem system REQUIRED)
 include_directories(${Boost_INCLUDE_DIR})
 
-# GLog (external)
-find_package(Glog 0.3.4 REQUIRED)
-
-# PCL (external)
-find_package(PCL 1.7 REQUIRED)
-include_directories(${PCL_INCLUDE_DIRS})
-link_directories(${PCL_LIBRARY_DIRS})
-add_definitions(${PCL_DEFINITIONS})
+# Loguru (packaged)
+add_library(loguru SHARED
+  libvis/third_party/loguru/loguru.cpp
+)
+set_property(TARGET loguru PROPERTY FOLDER "libvis/third_party")
+target_include_directories(loguru PUBLIC
+  libvis/third_party/loguru/
+)
+set_target_properties(loguru PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+)
+target_compile_definitions(loguru PRIVATE
+  LOGURU_WITH_STREAMS
+)
+if(MSVC)
+  set(LOGURU_DLL_EXPORT "__declspec(dllexport)")
+  #set(LOGURU_DLL_IMPORT "__declspec(dllimport)")
+endif()
+target_compile_definitions(loguru PRIVATE
+  LOGURU_EXPORT=${LOGURU_DLL_EXPORT}
+)
+target_link_libraries(loguru
+  Threads::Threads
+  ${CMAKE_DL_LIBS}
+)
 
 # GTest (packaged)
 add_subdirectory(libvis/third_party/gtest)
@@ -82,7 +122,18 @@ set(CMAKE_AUTOMOC ON)
 # Instruct CMake to run rcc (resource compiler) automatically when needed.
 set(CMAKE_AUTORCC ON)
 find_package(Qt5Widgets)
-find_package(Qt5X11Extras)
+
+if (UNIX AND NOT APPLE)
+  find_package(Qt5X11Extras REQUIRED)
+endif()
+if (TARGET Qt5::Core AND UNIX)
+  # HACK, see: https://gitlab.kitware.com/cmake/cmake/issues/16915
+  get_property( core_options TARGET Qt5::Core PROPERTY INTERFACE_COMPILE_OPTIONS )
+  string( REPLACE "-fPIC" "" new_core_options "${core_options}" )
+  set_property( TARGET Qt5::Core PROPERTY INTERFACE_COMPILE_OPTIONS ${new_core_options} )
+  set_property( TARGET Qt5::Core PROPERTY INTERFACE_POSITION_INDEPENDENT_CODE "ON" )
+  set( CMAKE_CXX_COMPILE_OPTIONS_PIE "-fPIC" )
+endif()
 find_package(Qt5OpenGL)
 
 if(Qt5Widgets_FOUND)
@@ -91,14 +142,19 @@ endif()
 
 
 # Settings.
-add_definitions("-Wall -Wextra -O2 -msse2 -msse3 -std=c++11")
-
-# TODO: It seems gcc cannot disable this locally, therefore added it here as a
-#       workaround.
-add_definitions("-Wno-unknown-pragmas")
-
 if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUXX)
-  add_definitions("-Wno-missing-field-initializers")
+  set(LIBVIS_WARNING_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-Wall>")
+  set(LIBVIS_WARNING_OPTIONS "${LIBVIS_WARNING_OPTIONS};$<$<COMPILE_LANGUAGE:CXX>:-Wextra>")
+  set(LIBVIS_WARNING_OPTIONS "${LIBVIS_WARNING_OPTIONS};$<$<COMPILE_LANGUAGE:CXX>:-O2>")
+  set(LIBVIS_WARNING_OPTIONS "${LIBVIS_WARNING_OPTIONS};$<$<COMPILE_LANGUAGE:CXX>:-msse2>")
+  set(LIBVIS_WARNING_OPTIONS "${LIBVIS_WARNING_OPTIONS};$<$<COMPILE_LANGUAGE:CXX>:-msse3>")
+  # TODO: It seems gcc cannot disable this locally, therefore added it here as a
+  #       workaround.
+  set(LIBVIS_WARNING_OPTIONS "${LIBVIS_WARNING_OPTIONS};$<$<COMPILE_LANGUAGE:CXX>:-Wno-unknown-pragmas>")
+  
+  # NOTE: Disabled this since it triggered in a lot of places, including external headers, creating a lot of warning spam.
+  set(LIBVIS_WARNING_OPTIONS "${LIBVIS_WARNING_OPTIONS};$<$<COMPILE_LANGUAGE:CXX>:-Wno-sign-compare>")
+  set(LIBVIS_WARNING_OPTIONS "${LIBVIS_WARNING_OPTIONS};$<$<COMPILE_LANGUAGE:CXX>:-Wno-missing-field-initializers>")
 endif()
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
@@ -109,6 +165,15 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 add_executable(bin2c
   ./libvis/src/bin2c/main.cc
+)
+set_property(TARGET bin2c PROPERTY FOLDER "libvis")
+
+target_include_directories(bin2c PRIVATE
+  ${Boost_INCLUDE_DIR}
+)
+
+target_compile_options(bin2c PRIVATE
+  "${LIBVIS_WARNING_OPTIONS}"
 )
 target_link_libraries(bin2c
   ${Boost_LIBRARIES}
@@ -173,7 +238,11 @@ set(LIBVIS_FILES
   libvis/src/libvis/camera_frustum_opengl.h
   libvis/src/libvis/command_line_parser.cc
   libvis/src/libvis/command_line_parser.h
+  libvis/src/libvis/dlt.h
   libvis/src/libvis/eigen.h
+  libvis/src/libvis/geometry.h
+  libvis/src/libvis/glew.cc
+  libvis/src/libvis/glew.h
   libvis/src/libvis/image.cc
   libvis/src/libvis/image.h
   libvis/src/libvis/image_cache.h
@@ -196,12 +265,18 @@ set(LIBVIS_FILES
   libvis/src/libvis/libvis.h
   libvis/src/libvis/lm_optimizer.h
   libvis/src/libvis/lm_optimizer_impl.h
+  libvis/src/libvis/lm_optimizer_update_accumulator.h
+  libvis/src/libvis/loss_functions.h
   libvis/src/libvis/mesh.h
   libvis/src/libvis/mesh_opengl.h
   libvis/src/libvis/opengl.cc
   libvis/src/libvis/opengl.h
   libvis/src/libvis/opengl_context.cc
   libvis/src/libvis/opengl_context.h
+  libvis/src/libvis/opengl_context_glx.cc
+  libvis/src/libvis/opengl_context_glx.h
+  libvis/src/libvis/opengl_context_qt.cc
+  libvis/src/libvis/opengl_context_qt.h
   libvis/src/libvis/patch_match_stereo.cc
   libvis/src/libvis/patch_match_stereo.h
   libvis/src/libvis/point_cloud.h
@@ -226,6 +301,7 @@ set(LIBVIS_FILES
   libvis/src/libvis/statistics.h
   libvis/src/libvis/timing.cc
   libvis/src/libvis/timing.h
+  libvis/src/libvis/util.h
   
   ${GENERATED_HEADERS}
   libvis/resources/resources.qrc
@@ -239,21 +315,30 @@ if(VULKAN_FOUND)
     ${LIBVIS_FILES}
   )
 endif()
-add_library(libvis SHARED
+
+add_library(libvis 
   ${LIBVIS_FILES}
 )
+set_property(TARGET libvis PROPERTY FOLDER "libvis")
+
+target_compile_options(libvis PRIVATE
+  "${LIBVIS_WARNING_OPTIONS}"
+)
+
+if(MSVC)
+  target_compile_definitions(libvis PUBLIC NOMINMAX) # to get rid of max define
+endif()
 
 set(BASE_LIB_LIBRARIES
   ${Boost_LIBRARIES}
   ${GLEW_LIBRARIES}
-  GL
-  glog
-  Qt5::Widgets
-  Qt5::X11Extras
-  Qt5::OpenGL
+  ${OPENGL_LIBRARY}
+  loguru
+  ${Qt5Widgets_LIBRARIES}
+  ${Qt5X11Extras_LIBRARIES}
+  ${Qt5Opengl_LIBRARIES}
   png
-  z
-  pthread
+  Threads::Threads
 )
 if(VULKAN_FOUND)
   set(BASE_LIB_LIBRARIES
@@ -272,20 +357,36 @@ set(BASE_LIB_LIBRARIES
 
 # libvis optional library: libvis_cuda.
 # Contains CUDA functionality, which is only useful with NVIDIA graphics cards.
-cuda_add_library(libvis_cuda SHARED
+add_library(libvis_cuda 
   libvis/src/libvis/cuda/cuda_auto_tuner.h
   libvis/src/libvis/cuda/cuda_buffer.cu
   libvis/src/libvis/cuda/cuda_buffer.cuh
   libvis/src/libvis/cuda/cuda_buffer.h
   libvis/src/libvis/cuda/cuda_buffer_inl.h
   libvis/src/libvis/cuda/cuda_matrix.cuh
-  libvis/src/libvis/cuda/cuda_unprojection_lookup.cu
   libvis/src/libvis/cuda/cuda_unprojection_lookup.cuh
   libvis/src/libvis/cuda/cuda_unprojection_lookup.h
   libvis/src/libvis/cuda/cuda_util.h
+  libvis/src/libvis/cuda/patch_match_stereo.cc
+  libvis/src/libvis/cuda/patch_match_stereo.cu
+  libvis/src/libvis/cuda/patch_match_stereo.cuh
+  libvis/src/libvis/cuda/patch_match_stereo.h
+  libvis/src/libvis/cuda/pixel_corner_projector.cuh
+  libvis/src/libvis/cuda/pixel_corner_projector.h
+)
+set_property(TARGET libvis_cuda PROPERTY FOLDER "libvis")
+target_include_directories(libvis_cuda PUBLIC
+  ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+)
+target_compile_options(libvis_cuda PRIVATE
+  "${LIBVIS_WARNING_OPTIONS}"
 )
 target_link_libraries(libvis_cuda
   libvis
+)
+target_compile_options(libvis_cuda PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 )
 
 

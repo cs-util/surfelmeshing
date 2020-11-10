@@ -5,9 +5,9 @@
 ## Overview ##
 
 SurfelMeshing is an approach for real-time surfel-based mesh reconstruction from
-RGB-D video, described in the following paper:
+RGB-D video, described in the following article:
 
-T. Schöps, T. Sattler, M. Pollefeys, "SurfelMeshing: Online Surfel-Based Mesh Reconstruction", ArXiv, 2018. \[[pdf](http://arxiv.org/abs/1810.00729)\]\[[video](https://youtu.be/ouspbzHk5L0)\]
+T. Schöps, T. Sattler, M. Pollefeys, "SurfelMeshing: Online Surfel-Based Mesh Reconstruction", PAMI 2019. \[[pdf](http://arxiv.org/abs/1810.00729)\]\[[video](https://youtu.be/CzMtNxuQ0OY)\]
 
 If you use the SurfelMeshing code for research, please cite this paper.
 
@@ -36,25 +36,25 @@ The following external dependencies are required (the versions in brackets are
 known to work):
 
 * Boost
-* CUDA (8)
+* CUDA (8, 10.1)
 * Eigen
 * GLEW
-* GLog
-* PCL (1.7)
-* Qt (5.2.1)
+* Qt (>= 5.10 should likely work)
 * zlib
-
-Notice that the versions of CUDA and Eigen must be compatible since some Eigen headers are included in
-code compiled by CUDA's nvcc compiler. For example, for CUDA version 9.1, it seemed that Eigen 3.3.6 is required.
-PCL also depends on Eigen and thus it might be important to ensure that it uses the same version.
 
 After obtaining all dependencies, the application can be built with CMake, for example as follows:
 ```
 mkdir build_RelWithDebInfo
 cd build_RelWithDebInfo
-cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_FLAGS="-arch=sm_61" ..
 make -j SurfelMeshing
 ```
+
+Make sure to specify suitable CUDA architecture(s) in CMAKE_CUDA_FLAGS.
+Common settings would either be the CUDA architecture of your graphics card only (in case
+you only intend to run the compiled application on the system it was compiled on), or a range of virtual
+architectures (in case the compiled application is intended for distribution).
+See the [corresponding CUDA documentation](https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#options-for-steering-gpu-code-generation-gpu-architecture).
 
 
 ## Running ##
@@ -184,6 +184,7 @@ A list of optional program arguments follows, grouped by category:
 #### Dataset playback ####
 
 * `--depth_scaling` (default 5000): Input depth scaling: input_depth = depth_scaling * depth_in_meters. The default is for TUM RGB-D benchmark datasets.
+* `--max_pose_interpolation_time_extent` (default 0.05): The maximum time (in seconds) between the timestamp of a frame, and the preceding respectively succeeding trajectory pose timestamp, to interpolate the frame's pose. If this threshold is exceeded, the frame will be dropped since no close-enough pose information is available.
 * `--start_frame` (default 0): First frame of the video to process.
 * `--end_frame` (default: 2147483647): If the video is longer, processing stops after end_frame.
 * `--pyramid_level` (default: 0): Specify the scale-space pyramid level to use. 0 uses the original sized images, 1 uses half the original resolution, etc.
